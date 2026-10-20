@@ -1,0 +1,204 @@
+# %% imports
+import os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, seaborn as sns
+from scipy import stats
+from sklearn.datasets import load_diabetes
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import (silhouette_score, mean_squared_error, r2_score,
+                             mean_absolute_error, roc_auc_score, roc_curve)
+from sklearn.model_selection import (train_test_split, KFold, cross_val_score,
+                                     cross_validate, GridSearchCV)
+from sklearn.linear_model import LinearRegression, Ridge, Lasso, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.inspection import permutation_importance
+
+FIG = "figs"
+os.makedirs(FIG, exist_ok=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
+SEED = 42
+
+# %% acquire
+data = load_diabetes(as_frame=True, scaled=False)
+df = data.frame.rename(columns={"s1": "tc", "s2": "ldl", "s3": "hdl", "s4": "tch",
+                                "s5": "ltg", "s6": "glu", "target": "progression"})
+print("Records:", len(df), "| columns:", df.shape[1])
+print("Target = quantitative measure of disease progression after one year")
+print(df.head(5).round(1))
+
+# %% quality
+q = pd.DataFrame({"missing": df.isna().sum(), "unique": df.nunique(),
+                  "min": df.min(), "max": df.max()})
+print(q)
+print("\nDuplicate rows:", int(df.duplicated().sum()))
+feats = [c for c in df.columns if c != "progression"]
+z = ((df[feats] - df[feats].mean()) / df[feats].std()).abs()
+print("Rows with any |z| > 3:", int((z > 3).any(axis=1).sum()), "of", len(df))
+print("Decision: values are clinically plausible -> keep all records")
+
+# %% eda
+fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+sns.histplot(df["progression"], kde=True, bins=25, color="#4f81bd", ax=ax[0])
+ax[0].set_title("Target distribution")
+cr = df.corr()
+tc = cr["progression"].drop("progression").sort_values()
+tc.plot.barh(ax=ax[1], color=np.where(tc > 0, "#c0504d", "#4f81bd"))
+ax[1].set_title("Correlation with progression"); ax[1].set_xlabel("Pearson r")
+sns.regplot(data=df, x="bmi", y="progression", ax=ax[2], color="#9bbb59",
+            scatter_kws={"s": 16, "alpha": .6}, line_kws={"color": "k"})
+ax[2].set_title(f"BMI vs progression (r = {df['bmi'].corr(df['progression']):.2f})")
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_eda.png", dpi=150)
+print(tc.sort_values(ascending=False).round(3).to_string())
+
+# %% heat
+plt.figure(figsize=(9, 7))
+sns.heatmap(cr, mask=np.triu(np.ones_like(cr, dtype=bool)), annot=True, fmt=".2f",
+            cmap="coolwarm", center=0, annot_kws={"size": 8})
+plt.title("Correlation matrix of all variables")
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_heat.png", dpi=150)
+print("Highest feature-feature correlation:",
+      cr.drop("progression").drop(columns="progression").where(
+          np.triu(np.ones((10, 10)), 1).astype(bool)).stack().abs().idxmax(),
+      round(cr.drop("progression").drop(columns="progression").where(
+          np.triu(np.ones((10, 10)), 1).astype(bool)).stack().abs().max(), 3))
+
+# %% fe
+fe = df.copy()
+fe["ldl_hdl_ratio"] = fe["ldl"] / fe["hdl"]
+fe["bmi_x_bp"] = fe["bmi"] * fe["bp"]
+fe["bmi_sq"] = fe["bmi"] ** 2
+fe["map_proxy"] = fe["bp"] * fe["age"] / 100
+new = ["ldl_hdl_ratio", "bmi_x_bp", "bmi_sq", "map_proxy"]
+print(fe[new].corrwith(fe["progression"]).round(3).to_string())
+
+# %% split
+X = fe.drop(columns="progression"); y = fe["progression"]
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=SEED)
+print("Train:", X_tr.shape, "Test:", X_te.shape)
+print("Target mean train/test:", round(y_tr.mean(), 1), "/", round(y_te.mean(), 1))
+
+# %% cluster
+Xs = StandardScaler().fit_transform(X_tr[feats])
+sil = {k: silhouette_score(Xs, KMeans(k, n_init=20, random_state=SEED).fit_predict(Xs)) for k in range(2, 8)}
+print("Silhouette by k:", {k: round(v, 3) for k, v in sil.items()})
+km = KMeans(3, n_init=20, random_state=SEED).fit(Xs)
+seg = X_tr.copy(); seg["segment"] = km.labels_; seg["progression"] = y_tr
+prof = seg.groupby("segment")[["age", "bmi", "bp", "hdl", "ltg", "glu", "progression"]].mean()
+prof["patients"] = seg.groupby("segment").size()
+order = prof["progression"].sort_values().index
+rename = {old: f"Segment {i + 1}" for i, old in enumerate(order)}
+prof.index = prof.index.map(rename); seg["segment"] = seg["segment"].map(rename)
+print(prof.sort_index().round(1))
+Z = PCA(2, random_state=SEED).fit_transform(Xs)
+fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+for s, c in zip(sorted(seg.segment.unique()), ["#4f81bd", "#f79646", "#c0504d"]):
+    m = (seg.segment == s).values
+    ax[0].scatter(Z[m, 0], Z[m, 1], s=26, color=c, label=s, alpha=.85)
+ax[0].set_title("Patient segments in PCA space"); ax[0].set_xlabel("PC1"); ax[0].set_ylabel("PC2"); ax[0].legend()
+sns.boxplot(data=seg.sort_values("segment"), x="segment", y="progression", hue="segment",
+            palette=["#4f81bd", "#f79646", "#c0504d"], ax=ax[1], legend=False)
+ax[1].set_title("Disease progression by segment (training patients)"); ax[1].set_xlabel("")
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_segments.png", dpi=150)
+
+# %% anova
+groups = [g["progression"].values for _, g in seg.groupby("segment")]
+f = stats.f_oneway(*groups)
+print(f"ANOVA across segments: F = {f.statistic:.1f}, p = {f.pvalue:.1e}")
+print("Segment differences are unsupervised (target not used to form them).")
+
+# %% models
+cv = KFold(5, shuffle=True, random_state=SEED)
+cols = feats
+models = {
+    "Linear Regression": make_pipeline(StandardScaler(), LinearRegression()),
+    "Ridge": make_pipeline(StandardScaler(), Ridge(alpha=10)),
+    "Lasso": make_pipeline(StandardScaler(), Lasso(alpha=1.0)),
+    "Random Forest": RandomForestRegressor(300, min_samples_leaf=5, random_state=SEED),
+    "Gradient Boosting": GradientBoostingRegressor(n_estimators=150, learning_rate=0.03,
+                                                    max_depth=2, random_state=SEED),
+}
+rows = {}
+for n, m in models.items():
+    r = cross_validate(m, X_tr[cols], y_tr, cv=cv, scoring=["r2", "neg_root_mean_squared_error"])
+    rows[n] = {"CV R2": r["test_r2"].mean(), "R2 std": r["test_r2"].std(),
+               "CV RMSE": -r["test_neg_root_mean_squared_error"].mean()}
+res = pd.DataFrame(rows).T
+print(res.round(3))
+print("Baseline RMSE (predict the mean):", round(y_tr.std(), 1))
+
+# %% fe_test
+rows = {}
+for label, c in [("10 original", feats), ("10 + 4 engineered", list(X.columns))]:
+    m = make_pipeline(StandardScaler(), Ridge(alpha=10))
+    r = cross_validate(m, X_tr[c], y_tr, cv=cv, scoring=["r2", "neg_root_mean_squared_error"])
+    rows[label] = {"CV R2": r["test_r2"].mean(), "CV RMSE": -r["test_neg_root_mean_squared_error"].mean()}
+seg_dummies = pd.get_dummies(seg["segment"], dtype=float).reindex(X_tr.index)
+m = make_pipeline(StandardScaler(), Ridge(alpha=10))
+r = cross_validate(m, pd.concat([X_tr[feats], seg_dummies], axis=1), y_tr, cv=cv,
+                   scoring=["r2", "neg_root_mean_squared_error"])
+rows["10 + cluster segment"] = {"CV R2": r["test_r2"].mean(), "CV RMSE": -r["test_neg_root_mean_squared_error"].mean()}
+print(pd.DataFrame(rows).T.round(3))
+
+# %% tune
+gs = GridSearchCV(GradientBoostingRegressor(random_state=SEED),
+                  {"n_estimators": [100, 200, 300], "learning_rate": [0.01, 0.03, 0.05],
+                   "max_depth": [1, 2, 3], "subsample": [0.7, 1.0]},
+                  cv=cv, scoring="neg_root_mean_squared_error", n_jobs=-1).fit(X_tr[cols], y_tr)
+print("Best GB params:", gs.best_params_)
+print("Best GB CV RMSE:", round(-gs.best_score_, 2))
+gs_r = GridSearchCV(make_pipeline(StandardScaler(), Ridge()), {"ridge__alpha": [0.1, 1, 3, 10, 30, 100]},
+                    cv=cv, scoring="neg_root_mean_squared_error").fit(X_tr[cols], y_tr)
+print("Best Ridge alpha:", gs_r.best_params_["ridge__alpha"], "| CV RMSE:", round(-gs_r.best_score_, 2))
+
+# %% evaluate
+cands = {"Ridge (tuned)": gs_r.best_estimator_, "Gradient Boosting (tuned)": gs.best_estimator_}
+out, preds = {}, {}
+for n, m in cands.items():
+    p = m.predict(X_te[cols]); preds[n] = p
+    out[n] = {"RMSE": np.sqrt(mean_squared_error(y_te, p)), "MAE": mean_absolute_error(y_te, p), "R2": r2_score(y_te, p)}
+ev = pd.DataFrame(out).T
+print(ev.round(3))
+bestname = ("Ridge (tuned)" if -gs_r.best_score_ <= -gs.best_score_
+            else "Gradient Boosting (tuned)")        # chosen by CV, not by test
+bp = preds[bestname]; bm = cands[bestname]
+print("Selected by cross-validation RMSE:", bestname)
+res_ = y_te - bp
+fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+ax[0].scatter(y_te, bp, s=28, color="#4f81bd", alpha=.8); lim = [y.min(), y.max()]
+ax[0].plot(lim, lim, "r--"); ax[0].set_xlabel("Actual progression"); ax[0].set_ylabel("Predicted")
+ax[0].set_title(f"Predicted vs actual (R2 = {r2_score(y_te, bp):.2f})")
+ax[1].scatter(bp, res_, s=28, color="#9bbb59", alpha=.8); ax[1].axhline(0, color="r", ls="--")
+ax[1].set_xlabel("Predicted"); ax[1].set_ylabel("Residual"); ax[1].set_title("Residuals vs predicted")
+sns.histplot(res_, kde=True, ax=ax[2], color="#8064a2"); ax[2].set_title("Residual distribution")
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_eval.png", dpi=150)
+print("Residual mean:", round(res_.mean(), 2), "| residual std:", round(res_.std(), 2))
+
+# %% importance
+pi = permutation_importance(bm, X_te[cols], y_te, n_repeats=30, random_state=SEED, scoring="r2")
+imp = pd.Series(pi.importances_mean, index=cols).sort_values(ascending=False)
+print(imp.round(3).to_string())
+plt.figure(figsize=(7.5, 5))
+imp[::-1].plot.barh(xerr=pd.Series(pi.importances_std, index=cols)[imp[::-1].index], color="#c0504d")
+plt.xlabel("Drop in R2 when the feature is shuffled"); plt.title("Permutation importance on the test set")
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_importance.png", dpi=150)
+
+# %% risk
+thr = y_tr.quantile(.75)
+yb_tr, yb_te = (y_tr > thr).astype(int), (y_te > thr).astype(int)
+clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=3000, C=0.5)).fit(X_tr[cols], yb_tr)
+pr = clf.predict_proba(X_te[cols])[:, 1]
+auc = roc_auc_score(yb_te, pr)
+reg_auc = roc_auc_score(yb_te, bp)
+print(f"High-risk threshold (top 25%): progression > {thr:.0f}")
+print(f"Logistic classifier AUC on test : {auc:.3f}")
+print(f"Regression model used as scorer : {reg_auc:.3f}")
+order_ = np.argsort(-pr); top = order_[: int(0.25 * len(pr))]
+print(f"Flagging top 25% of patients by risk captures {yb_te.values[top].sum()} of {yb_te.sum()} high-risk cases")
+fig, ax = plt.subplots(figsize=(6.2, 4.8))
+for lab, sc_, c in [("Logistic classifier", pr, "#4f81bd"), ("Regression score", bp, "#c0504d")]:
+    fpr, tpr, _ = roc_curve(yb_te, sc_); ax.plot(fpr, tpr, color=c, lw=2, label=f"{lab} (AUC {roc_auc_score(yb_te, sc_):.2f})")
+ax.plot([0, 1], [0, 1], "k--"); ax.set_xlabel("False positive rate"); ax.set_ylabel("True positive rate")
+ax.set_title("Identifying high-progression patients"); ax.legend()
+plt.tight_layout(); plt.savefig(f"{FIG}/w6_risk.png", dpi=150)
