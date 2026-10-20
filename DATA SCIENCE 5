@@ -1,0 +1,188 @@
+# %% imports
+import os, time, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, seaborn as sns
+from sklearn.datasets import load_digits
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss, confusion_matrix, classification_report
+
+FIG = "figs"
+os.makedirs(FIG, exist_ok=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
+SEED = 42
+
+# %% load
+digits = load_digits()
+X, y = digits.data, digits.target
+print("Images:", X.shape[0], " pixels per image:", X.shape[1], "(8 x 8)")
+print("Pixel range:", X.min(), "to", X.max())
+print("Class counts:", np.bincount(y).tolist())
+fig, ax = plt.subplots(3, 10, figsize=(13, 4.4))
+for i, a in enumerate(ax.ravel()):
+    a.imshow(digits.images[i], cmap="gray_r"); a.set_title(f"label {y[i]}", fontsize=9); a.axis("off")
+plt.suptitle("Sample handwritten digits from the dataset", fontsize=14)
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_samples.png", dpi=150)
+
+# %% split
+X_tmp, X_te, y_tmp, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=SEED)
+X_tr, X_va, y_tr, y_va = train_test_split(X_tmp, y_tmp, test_size=0.2, stratify=y_tmp, random_state=SEED)
+sc = StandardScaler().fit(X_tr)
+X_tr, X_va, X_te = sc.transform(X_tr), sc.transform(X_va), sc.transform(X_te)
+print("Train / validation / test:", len(X_tr), len(X_va), len(X_te))
+base = LogisticRegression(max_iter=3000).fit(X_tr, y_tr)
+print("Baseline logistic regression validation accuracy:", round(base.score(X_va, y_va), 4))
+
+# %% train_fn
+def train(hidden, alpha=1e-4, lr=1e-3, act="relu", epochs=60, seed=SEED, Xt=None, yt=None):
+    Xt = X_tr if Xt is None else Xt
+    yt = y_tr if yt is None else yt
+    net = MLPClassifier(hidden_layer_sizes=hidden, activation=act, alpha=alpha,
+                        learning_rate_init=lr, solver="adam", batch_size=32,
+                        random_state=seed)
+    hist = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    for ep in range(epochs):
+        net.partial_fit(Xt, yt, classes=np.arange(10))
+        hist["train_loss"].append(log_loss(yt, net.predict_proba(Xt), labels=np.arange(10)))
+        hist["val_loss"].append(log_loss(y_va, net.predict_proba(X_va), labels=np.arange(10)))
+        hist["train_acc"].append(net.score(Xt, yt))
+        hist["val_acc"].append(net.score(X_va, y_va))
+    return net, pd.DataFrame(hist)
+
+# %% arch_diagram
+def draw_net(ax, sizes, names):
+    xs = np.linspace(0.08, 0.92, len(sizes))
+    for x, s, n in zip(xs, sizes, names):
+        shown = min(s, 10)
+        ys = np.linspace(0.26, 0.9, shown)
+        ax.scatter([x] * shown, ys, s=230, color="#4f81bd", edgecolor="k", zorder=3)
+        if s > shown:
+            ax.text(x, 0.5, "...", ha="center", va="center", fontsize=20, color="white", zorder=4)
+        ax.text(x, 0.0, f"{n}\n({s})", ha="center", fontsize=10)
+    for (x1, s1), (x2, s2) in zip(zip(xs[:-1], sizes[:-1]), zip(xs[1:], sizes[1:])):
+        y1 = np.linspace(0.26, 0.9, min(s1, 10)); y2 = np.linspace(0.26, 0.9, min(s2, 10))
+        for a in y1:
+            for b in y2: ax.plot([x1, x2], [a, b], color="grey", alpha=.18, lw=.5, zorder=1)
+    ax.set_ylim(-0.08, 1.0); ax.axis("off")
+fig, ax = plt.subplots(figsize=(11, 4.8))
+draw_net(ax, [64, 128, 64, 10], ["Input\n8x8 pixels", "Dense 1\nReLU", "Dense 2\nReLU", "Output\nSoftmax"])
+ax.set_title("Architecture of the selected network: 64 - 128 - 64 - 10", fontsize=14)
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_arch.png", dpi=150)
+n_par = 64 * 128 + 128 + 128 * 64 + 64 + 64 * 10 + 10
+print("Trainable parameters of 64-128-64-10 network:", f"{n_par:,}")
+
+# %% compare_arch
+configs = {"Shallow [32]": (32,), "Medium [64]": (64,), "Deep [128, 64]": (128, 64),
+           "Deeper [256,128,64]": (256, 128, 64)}
+rows, hists = [], {}
+for name, h in configs.items():
+    t0 = time.time()
+    net, hist = train(h, epochs=60)
+    hists[name] = hist
+    rows.append((name, hist.train_acc.iloc[-1], hist.val_acc.iloc[-1], hist.val_loss.min(),
+                 hist.val_loss.idxmin() + 1, time.time() - t0))
+arch = pd.DataFrame(rows, columns=["architecture", "train acc", "val acc", "min val loss", "best epoch", "seconds"])
+print(arch.round(3).to_string(index=False))
+fig, ax = plt.subplots(1, 2, figsize=(13, 4.8))
+for (n, h), c in zip(hists.items(), ["#4f81bd", "#9bbb59", "#c0504d", "#8064a2"]):
+    ax[0].plot(h.val_loss, label=n, color=c); ax[1].plot(h.val_acc, label=n, color=c)
+ax[0].set_title("Validation loss by architecture"); ax[0].set_xlabel("Epoch"); ax[0].set_ylabel("Cross-entropy loss")
+ax[1].set_title("Validation accuracy by architecture"); ax[1].set_xlabel("Epoch"); ax[1].set_ylabel("Accuracy")
+ax[1].set_ylim(0.9, 1.0); ax[0].legend(); plt.tight_layout(); plt.savefig(f"{FIG}/w5_arch_compare.png", dpi=150)
+
+# %% overfit
+n_small = 250
+Xs_, ys_ = X_tr[:n_small], y_tr[:n_small]
+rows, hh = [], {}
+for al in [0.0, 0.01, 0.1, 1.0, 3.0]:
+    _, h = train((256, 128), alpha=al, epochs=80, Xt=Xs_, yt=ys_)
+    hh[al] = h
+    rows.append((al, h.train_acc.iloc[-1], h.val_acc.iloc[-1], h.val_loss.min(),
+                 int(h.val_loss.idxmin()) + 1, h.val_loss.iloc[-1]))
+ov = pd.DataFrame(rows, columns=["L2 alpha", "train acc", "val acc", "min val loss", "best epoch", "final val loss"])
+print(f"Training a 256-128 network on only {n_small} images")
+print(ov.round(3).to_string(index=False))
+fig, ax = plt.subplots(1, 2, figsize=(13, 4.6))
+h = hh[0.0]
+ax[0].plot(h.train_loss, label="Training loss", color="#4f81bd"); ax[0].plot(h.val_loss, label="Validation loss", color="#c0504d")
+ax[0].axvline(h.val_loss.idxmin(), ls="--", color="grey", label="Lowest validation loss")
+ax[0].set_title("Small training set, no regularisation"); ax[0].set_xlabel("Epoch"); ax[0].set_ylabel("Loss"); ax[0].legend()
+for al, c in zip(hh, ["#4f81bd", "#9bbb59", "#f79646", "#c0504d", "#8064a2"]):
+    ax[1].plot(hh[al].val_loss, label=f"alpha = {al}", color=c)
+ax[1].set_title("Validation loss for different L2 penalties"); ax[1].set_xlabel("Epoch"); ax[1].set_ylabel("Validation loss"); ax[1].legend()
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_overfit.png", dpi=150)
+
+# %% hyper
+rows = []
+for act in ["relu", "tanh", "logistic"]:
+    for lr in [1e-4, 1e-3, 1e-2]:
+        _, h = train((128, 64), lr=lr, act=act, epochs=40)
+        rows.append((act, lr, h.val_acc.iloc[-1], h.val_loss.iloc[-1]))
+hp = pd.DataFrame(rows, columns=["activation", "learning rate", "val acc", "val loss"])
+print(hp.round(4).to_string(index=False))
+piv = hp.pivot(index="activation", columns="learning rate", values="val acc")
+plt.figure(figsize=(7, 3.8))
+sns.heatmap(piv, annot=True, fmt=".3f", cmap="YlGnBu", cbar_kws={"label": "Validation accuracy"})
+plt.title("Activation x learning rate (40 epochs)")
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_hyper.png", dpi=150)
+
+# %% final
+final, hist = train((128, 64), alpha=1e-3, lr=1e-3, act="relu", epochs=60)
+best_ep = int(hist.val_loss.idxmin()) + 1
+print("Epoch with lowest validation loss:", best_ep)
+pred = final.predict(X_te)
+print("Test accuracy:", round(accuracy_score(y_te, pred), 4))
+print(classification_report(y_te, pred, digits=3))
+fig, ax = plt.subplots(1, 2, figsize=(13, 4.6))
+ax[0].plot(hist.train_loss, label="Training", color="#4f81bd"); ax[0].plot(hist.val_loss, label="Validation", color="#c0504d")
+ax[0].axvline(best_ep - 1, ls="--", color="grey"); ax[0].set_title("Loss curves of the final model")
+ax[0].set_xlabel("Epoch"); ax[0].set_ylabel("Cross-entropy loss"); ax[0].legend()
+ax[1].plot(hist.train_acc, label="Training", color="#4f81bd"); ax[1].plot(hist.val_acc, label="Validation", color="#c0504d")
+ax[1].set_title("Accuracy curves of the final model"); ax[1].set_xlabel("Epoch"); ax[1].set_ylabel("Accuracy")
+ax[1].set_ylim(0.9, 1.005); ax[1].legend()
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_final_curves.png", dpi=150)
+
+# %% confusion
+cm = confusion_matrix(y_te, pred)
+plt.figure(figsize=(7, 5.8))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False)
+plt.xlabel("Predicted digit"); plt.ylabel("True digit"); plt.title("Confusion matrix on the test set")
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_confusion.png", dpi=150)
+off = cm.copy(); np.fill_diagonal(off, 0)
+i, j = np.unravel_index(off.argmax(), off.shape)
+print("Most frequent confusion: true", i, "predicted as", j, "->", off.max(), "times")
+print("Total errors:", int((pred != y_te).sum()), "of", len(y_te))
+wrong = np.where(pred != y_te)[0]
+raw_te = sc.inverse_transform(X_te)
+fig, ax = plt.subplots(1, max(len(wrong), 2), figsize=(2.4 * max(len(wrong), 2), 2.9))
+for a, k in zip(np.atleast_1d(ax), wrong):
+    a.imshow(raw_te[k].reshape(8, 8), cmap="gray_r"); a.axis("off")
+    a.set_title(f"true {y_te[k]}\npred {pred[k]}", fontsize=10, color="#c0504d")
+plt.suptitle("Misclassified test images", fontsize=12)
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_errors.png", dpi=150)
+
+# %% filters
+W = final.coefs_[0]
+fig, ax = plt.subplots(3, 8, figsize=(12, 4.8))
+for k, a in enumerate(ax.ravel()):
+    a.imshow(W[:, k].reshape(8, 8), cmap="RdBu_r"); a.axis("off"); a.set_title(f"unit {k}", fontsize=8)
+plt.suptitle("First-layer weights reshaped as 8x8 images (24 of 128 units)", fontsize=13)
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_filters.png", dpi=150)
+
+# %% robustness
+rng = np.random.default_rng(SEED)
+levels = [0, 0.25, 0.5, 0.75, 1.0, 1.5]
+acc_nn, acc_lr = [], []
+for s in levels:
+    Xn = X_te + rng.normal(0, s, X_te.shape)
+    acc_nn.append(final.score(Xn, y_te)); acc_lr.append(base.score(Xn, y_te))
+rob = pd.DataFrame({"noise sd": levels, "MLP": acc_nn, "Logistic reg.": acc_lr})
+print(rob.round(3).to_string(index=False))
+print("\nClean test accuracy: MLP", round(final.score(X_te, y_te), 4), "| baseline", round(base.score(X_te, y_te), 4))
+plt.figure(figsize=(7, 4.4))
+plt.plot(levels, acc_nn, "o-", color="#4f81bd", label="MLP (128-64)")
+plt.plot(levels, acc_lr, "s--", color="#c0504d", label="Logistic regression")
+plt.xlabel("Std. dev. of Gaussian noise (standardised units)"); plt.ylabel("Test accuracy")
+plt.title("Robustness to input noise"); plt.legend()
+plt.tight_layout(); plt.savefig(f"{FIG}/w5_robust.png", dpi=150)
