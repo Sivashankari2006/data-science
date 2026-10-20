@@ -1,0 +1,176 @@
+# %% imports
+import os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, seaborn as sns
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import (train_test_split, StratifiedKFold, cross_validate,
+                                     GridSearchCV, learning_curve)
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import (confusion_matrix, classification_report, roc_curve, auc,
+                             precision_recall_curve, average_precision_score,
+                             accuracy_score, recall_score, precision_score, f1_score,
+                             RocCurveDisplay)
+
+FIG = "figs"
+os.makedirs(FIG, exist_ok=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
+SEED = 42
+
+# %% load
+bc = load_breast_cancer(as_frame=True)
+X = bc.data.copy()
+y = (1 - bc.target).rename("malignant")   # 1 = malignant (positive class)
+print("Samples x features:", X.shape)
+print("Missing values    :", int(X.isna().sum().sum()))
+print("Class balance     :", {"benign": int((y == 0).sum()), "malignant": int((y == 1).sum())})
+print("Malignant share   :", f"{y.mean():.1%}")
+
+# %% balance
+fig, ax = plt.subplots(1, 3, figsize=(15, 4.4))
+y.map({0: "Benign", 1: "Malignant"}).value_counts().plot.bar(ax=ax[0], color=["#4f81bd", "#c0504d"], rot=0)
+ax[0].set_title("Class distribution"); ax[0].set_ylabel("Patients")
+for a, c in zip(ax[1:], ["worst concave points", "worst perimeter"]):
+    sns.kdeplot(data=X.assign(Class=y.map({0: "Benign", 1: "Malignant"})), x=c, hue="Class",
+                fill=True, palette=["#4f81bd", "#c0504d"], ax=a)
+    a.set_title(f"{c} by class")
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_balance.png", dpi=150)
+
+# %% corr_target
+ct = X.corrwith(y).sort_values()
+print("Strongest positive:")
+print(ct.tail(4).round(3).to_string())
+print("Strongest negative:")
+print(ct.head(3).round(3).to_string())
+plt.figure(figsize=(7.5, 8))
+ct.plot.barh(color=np.where(ct > 0, "#c0504d", "#4f81bd"))
+plt.title("Correlation of each feature with malignancy"); plt.xlabel("Pearson r")
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_corr_target.png", dpi=150)
+
+# %% features
+Xf = X.copy()
+Xf["compactness_ratio"] = X["mean perimeter"] ** 2 / X["mean area"]
+Xf["concavity_x_points"] = X["mean concavity"] * X["mean concave points"]
+Xf["radius_growth"] = X["worst radius"] / X["mean radius"]
+Xf["area_growth"] = X["worst area"] / X["mean area"]
+Xf["texture_growth"] = X["worst texture"] / X["mean texture"]
+Xf["error_to_mean_area"] = X["area error"] / X["mean area"]
+new = [c for c in Xf.columns if c not in X.columns]
+print("Engineered features:", new)
+print(Xf[new].corrwith(y).round(3).to_string())
+
+# %% split
+X_tr, X_te, y_tr, y_te = train_test_split(Xf, y, test_size=0.2, stratify=y, random_state=SEED)
+print("Train:", X_tr.shape, " Test:", X_te.shape)
+print("Malignant share train/test:", f"{y_tr.mean():.3f} / {y_te.mean():.3f}")
+
+# %% models
+cv = StratifiedKFold(5, shuffle=True, random_state=SEED)
+models = {
+    "Dummy (majority)": DummyClassifier(strategy="most_frequent"),
+    "Logistic Regression": make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000)),
+    "KNN (k=7)": make_pipeline(StandardScaler(), KNeighborsClassifier(7)),
+    "SVM (RBF)": make_pipeline(StandardScaler(), SVC(probability=True, random_state=SEED)),
+    "Random Forest": RandomForestClassifier(300, random_state=SEED),
+    "Gradient Boosting": GradientBoostingClassifier(random_state=SEED),
+}
+scoring = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+rows = {}
+for name, mdl in models.items():
+    r = cross_validate(mdl, X_tr, y_tr, cv=cv, scoring=scoring)
+    rows[name] = {s: r[f"test_{s}"].mean() for s in scoring}
+    rows[name]["acc_std"] = r["test_accuracy"].std()
+cvres = pd.DataFrame(rows).T
+print(cvres.round(3))
+ax = cvres[["accuracy", "recall", "f1", "roc_auc"]].plot.bar(figsize=(11, 4.8), rot=20, width=.8)
+ax.set_ylim(0.5, 1.02); ax.set_title("5-fold cross-validated performance (training set)")
+ax.set_ylabel("Score"); ax.legend(loc="lower right", ncol=4)
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_models.png", dpi=150)
+
+# %% fe_effect
+base = make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000))
+a = cross_validate(base, X_tr[X.columns], y_tr, cv=cv, scoring=["accuracy", "recall", "roc_auc"])
+b = cross_validate(base, X_tr, y_tr, cv=cv, scoring=["accuracy", "recall", "roc_auc"])
+eff = pd.DataFrame({"original 30": {k[5:]: v.mean() for k, v in a.items() if k.startswith("test_")},
+                    "30 + 6 engineered": {k[5:]: v.mean() for k, v in b.items() if k.startswith("test_")}})
+print(eff.round(4))
+
+# %% tune
+grid = {"svc__C": [0.1, 1, 3, 10, 30], "svc__gamma": ["scale", 0.003, 0.01, 0.03]}
+gs = GridSearchCV(make_pipeline(StandardScaler(), SVC(probability=True, random_state=SEED)),
+                  grid, cv=cv, scoring="roc_auc", n_jobs=-1).fit(X_tr, y_tr)
+print("SVM best params :", gs.best_params_)
+print("SVM best CV AUC :", round(gs.best_score_, 4))
+gs_lr = GridSearchCV(make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000)),
+                     {"logisticregression__C": [0.01, 0.03, 0.1, 0.3, 1, 3, 10]},
+                     cv=cv, scoring="roc_auc", n_jobs=-1).fit(X_tr, y_tr)
+print("LogReg best C   :", gs_lr.best_params_["logisticregression__C"])
+print("LogReg best AUC :", round(gs_lr.best_score_, 4))
+best = gs_lr if gs_lr.best_score_ >= gs.best_score_ else gs
+print("Selected model  :", "Logistic Regression" if best is gs_lr else "SVM")
+
+# %% test
+model = best.best_estimator_
+pred = model.predict(X_te)
+proba = model.predict_proba(X_te)[:, 1]
+print(classification_report(y_te, pred, target_names=["Benign", "Malignant"], digits=3))
+print("ROC AUC:", round(auc(*roc_curve(y_te, proba)[:2]), 4))
+cm = confusion_matrix(y_te, pred)
+print("Confusion matrix [[TN FP][FN TP]]:", cm.tolist())
+fig, ax = plt.subplots(1, 3, figsize=(16, 4.8))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=ax[0],
+            xticklabels=["Benign", "Malignant"], yticklabels=["Benign", "Malignant"], annot_kws={"size": 16})
+ax[0].set_title("Confusion matrix (test set)"); ax[0].set_xlabel("Predicted"); ax[0].set_ylabel("Actual")
+fpr, tpr, _ = roc_curve(y_te, proba)
+ax[1].plot(fpr, tpr, color="#c0504d", lw=2, label=f"AUC = {auc(fpr, tpr):.3f}")
+ax[1].plot([0, 1], [0, 1], "k--"); ax[1].set_title("ROC curve"); ax[1].legend()
+ax[1].set_xlabel("False positive rate"); ax[1].set_ylabel("True positive rate")
+p, r, _ = precision_recall_curve(y_te, proba)
+ax[2].plot(r, p, color="#4f81bd", lw=2, label=f"AP = {average_precision_score(y_te, proba):.3f}")
+ax[2].set_title("Precision-recall curve"); ax[2].legend()
+ax[2].set_xlabel("Recall"); ax[2].set_ylabel("Precision")
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_test.png", dpi=150)
+
+# %% threshold
+rows = []
+for t in [0.5, 0.4, 0.3, 0.2, 0.1]:
+    pr = (proba >= t).astype(int)
+    rows.append((t, accuracy_score(y_te, pr), precision_score(y_te, pr), recall_score(y_te, pr),
+                 int(((pr == 0) & (y_te == 1)).sum()), int(((pr == 1) & (y_te == 0)).sum())))
+th = pd.DataFrame(rows, columns=["threshold", "accuracy", "precision", "recall", "missed cancers", "false alarms"])
+print(th.round(3).to_string(index=False))
+
+# %% importance
+rf = RandomForestClassifier(500, random_state=SEED).fit(X_tr, y_tr)
+imp = pd.Series(rf.feature_importances_, index=X_tr.columns).sort_values(ascending=False)
+pi = permutation_importance(model, X_te, y_te, n_repeats=30, random_state=SEED, scoring="roc_auc")
+pim = pd.Series(pi.importances_mean, index=X_tr.columns).sort_values(ascending=False)
+print("Random Forest top 6:"); print(imp.head(6).round(3).to_string())
+print("\nPermutation importance (selected model) top 6:"); print(pim.head(6).round(4).to_string())
+fig, ax = plt.subplots(1, 2, figsize=(14, 5.2))
+imp.head(12)[::-1].plot.barh(ax=ax[0], color="#9bbb59"); ax[0].set_title("Random Forest feature importance (top 12)")
+pim.head(12)[::-1].plot.barh(ax=ax[1], color="#8064a2"); ax[1].set_title("Permutation importance, selected model (top 12)")
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_importance.png", dpi=150)
+
+# %% learning
+sz, trs, vas = learning_curve(model, X_tr, y_tr, cv=cv, scoring="accuracy",
+                              train_sizes=np.linspace(.15, 1, 8), n_jobs=-1)
+plt.figure(figsize=(7.5, 4.6))
+plt.plot(sz, trs.mean(1), "o-", color="#4f81bd", label="Training accuracy")
+plt.plot(sz, vas.mean(1), "o-", color="#c0504d", label="Validation accuracy")
+plt.fill_between(sz, vas.mean(1) - vas.std(1), vas.mean(1) + vas.std(1), color="#c0504d", alpha=.15)
+plt.xlabel("Training examples"); plt.ylabel("Accuracy"); plt.legend(); plt.title("Learning curve of the selected model")
+plt.tight_layout(); plt.savefig(f"{FIG}/w4_learning.png", dpi=150)
+print("Final train acc:", round(trs.mean(1)[-1], 3), " validation acc:", round(vas.mean(1)[-1], 3))
+
+# %% errors
+wrong = X_te[pred != y_te].copy()
+wrong["actual"] = y_te[pred != y_te].map({0: "benign", 1: "malignant"})
+wrong["P(malignant)"] = proba[pred != y_te]
+print("Misclassified test cases:", len(wrong))
+print(wrong[["actual", "P(malignant)", "mean radius", "worst concave points"]].round(3))
