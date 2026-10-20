@@ -1,0 +1,120 @@
+import os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, seaborn as sns
+from sklearn.datasets import load_breast_cancer
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+ FIG = "figs"
+os.makedirs(FIG, exist_ok=True)
+os.makedirs("out", exist_ok=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
+RNG = np.random.default_rng(42)
+bc = load_breast_cancer(as_frame=True)
+original = bc.frame.copy()          # ground truth (clean) copy
+print("Shape:", original.shape)
+print("Target meaning:", {0: "malignant", 1: "benign"})
+print(original.iloc[:5, [0, 1, 2, 3, 30]])
+raw = original.copy()
+cols = ["mean radius", "mean texture", "mean perimeter", "mean smoothness",
+        "mean compactness", "mean concavity", "worst radius", "worst area"]
+log = {}
+for c in cols:                                   # 1. missing values
+    idx = RNG.choice(raw.index, size=int(0.04 * len(raw)), replace=False)
+    raw.loc[idx, c] = np.nan
+    log[c] = len(idx)
+bad = RNG.choice(raw.index, 6, replace=False)    # 2. impossible negatives
+raw.loc[bad, "mean texture"] = -raw.loc[bad, "mean texture"]
+big = RNG.choice(raw.index, 5, replace=False)    # 3. decimal-place errors
+raw.loc[big, "mean area"] = raw.loc[big, "mean area"] * 10
+raw["mean fractal dimension"] = raw["mean fractal dimension"].astype(object)
+raw.loc[RNG.choice(raw.index, 4, replace=False),
+        "mean fractal dimension"] = "?"          # 4. placeholder text
+labels = raw["target"].map({0: "malignant", 1: "benign"})
+noisy = {"malignant": ["Malignant", "M", "malignant ", "MALIGNANT"],
+         "benign": ["Benign", "B", " benign", "BENIGN"]}
+raw["diagnosis"] = [RNG.choice(noisy[l]) if RNG.random() < 0.15 else l
+                    for l in labels]              # 5. inconsistent labels
+raw = raw.drop(columns="target")
+raw = pd.concat([raw, raw.sample(12, random_state=1)])   # 6. duplicates
+raw = raw.sample(frac=1, random_state=7).reset_index(drop=True)
+raw.to_csv("out/week1_raw_dataset.csv", index=False)
+print("Injected defects:", {"missing/col": 23, "negatives": 6,
+      "area x10": 5, "'?' tokens": 4, "duplicates": 12})
+print("Raw dataset shape:", raw.shape)
+print(raw.shape)
+print(raw.dtypes.value_counts())
+print("\nObject columns:", list(raw.select_dtypes(exclude="number").columns))
+print("Duplicate rows :", raw.duplicated().sum())
+print("Total missing  :", int(raw.isna().sum().sum()))
+print("\nDiagnosis labels:")
+print(raw["diagnosis"].value_counts().to_string())
+num = raw.drop(columns=["diagnosis", "mean fractal dimension"])
+print(num[["mean radius", "mean texture", "mean perimeter",
+           "mean area"]].describe().round(2))
+miss = raw.isna().sum()
+miss = miss[miss > 0].sort_values(ascending=False)
+print(pd.DataFrame({"missing": miss, "percent": (miss / len(raw) * 100)}))
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+sns.heatmap(raw.isna().iloc[:120, :12], cbar=False, cmap="viridis",
+            yticklabels=False, ax=ax[0])
+ax[0].set_title("Missing-value map (first 120 rows, 12 columns)")
+(miss / len(raw) * 100).plot.barh(ax=ax[1], color="#c0504d")
+ax[1].set_title("Percentage of missing values per column")
+ax[1].set_xlabel("Missing (%)")
+plt.tight_layout(); plt.savefig(f"{FIG}/w1_missing.png", dpi=150)
+df = raw.copy()
+df["mean fractal dimension"] = pd.to_numeric(
+    df["mean fractal dimension"].replace("?", np.nan))
+print("Dtype now:", df["mean fractal dimension"].dtype)
+df["diagnosis"] = (df["diagnosis"].str.strip().str.lower()
+                   .map({"malignant": "malignant", "m": "malignant",
+                         "benign": "benign", "b": "benign"}))
+print(df["diagnosis"].value_counts().to_string())
+before = len(df)
+df = df.drop_duplicates().reset_index(drop=True)
+print(f"Duplicates removed: {before - len(df)}  -> shape {df.shape}")
+neg = (df.drop(columns="diagnosis") < 0).sum()
+print("Negative values per column:")
+print(neg[neg > 0].to_string())
+df.loc[df["mean texture"] < 0, "mean texture"] = np.nan
+exp_area = np.pi * df["mean radius"] ** 2
+ratio = df["mean area"] / exp_area
+flag = ratio > 1.6
+print("\nArea/(pi*r^2) ratio: median =", round(ratio.median(), 3))
+print("Rows violating geometry rule:", int(flag.sum()))
+print(df.loc[flag, ["mean radius", "mean area"]].round(1))
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+ax[0].scatter(df["mean radius"], df["mean area"], s=14, c=np.where(flag, "red", "#4f81bd"))
+ax[0].set_xlabel("mean radius"); ax[0].set_ylabel("mean area")
+ax[0].set_title("Radius vs area (red = inconsistent entries)")
+sns.boxplot(x=df["mean area"], ax=ax[1], color="#9bbb59")
+ax[1].set_title("Boxplot of mean area before correction")
+plt.tight_layout(); plt.savefig(f"{FIG}/w1_errors.png", dpi=150)
+df.loc[flag, "mean area"] = np.nan
+feat = [c for c in df.columns if c != "diagnosis"]
+complete = df[feat].dropna()
+mask_cols = ["mean radius", "mean texture", "mean concavity", "worst area"]
+test = complete.copy()
+true_vals, m = {}, {}
+for c in mask_cols:
+    ix = RNG.choice(test.index, size=int(0.1 * len(test)), replace=False)
+    m[c] = ix; true_vals[c] = test.loc[ix, c].copy(); test.loc[ix, c] = np.nan
+def nrmse(imp):
+    out = []
+    for c in mask_cols:
+        e = np.sqrt(((imp.loc[m[c], c] - true_vals[c]) ** 2).mean())
+        out.append(e / complete[c].std())
+    return np.mean(out)
+mean_i = pd.DataFrame(SimpleImputer(strategy="mean").fit_transform(test), columns=feat, index=test.index)
+med_i = pd.DataFrame(SimpleImputer(strategy="median").fit_transform(test), columns=feat, index=test.index)
+sc = StandardScaler().fit(test)
+knn_i = pd.DataFrame(sc.inverse_transform(KNNImputer(n_neighbors=5).fit_transform(sc.transform(test))), columns=feat, index=test.index)
+res = pd.Series({"Mean": nrmse(mean_i), "Median": nrmse(med_i), "KNN (k=5)": nrmse(knn_i)})
+print("Normalised RMSE of imputation (lower is better):")
+print(res.round(3).to_string())
+plt.figure(figsize=(6.5, 4))
+res.plot.bar(color=["#4f81bd", "#9bbb59", "#c0504d"], rot=0)
+plt.ylabel("Normalised RMSE"); plt.title("Imputation strategy comparison")
+plt.tight_layout(); plt.savefig(f"{FIG}/w1_impute.png", dpi=150)
