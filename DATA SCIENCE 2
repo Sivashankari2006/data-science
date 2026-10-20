@@ -1,0 +1,48 @@
+Code 1: Libraries and plotting style
+import os, numpy as np, pandas as pd
+import matplotlib.pyplot as plt, seaborn as sns
+from scipy import stats
+from sklearn.datasets import load_diabetes
+ 
+FIG = "figs"
+os.makedirs(FIG, exist_ok=True)
+sns.set_theme(style="whitegrid", font="DejaVu Sans")
+
+Code 2: Loading and renaming the data
+raw = load_diabetes(as_frame=True, scaled=False)
+df = raw.frame.rename(columns={"s1": "tc", "s2": "ldl", "s3": "hdl",
+                               "s4": "tch", "s5": "ltg", "s6": "glu",
+                               "target": "progression"})
+print("Shape:", df.shape)
+print(df.head(6))
+Code 3: Data types, missing values and duplicates
+print(df.dtypes.to_string())
+print("\nMissing values:", int(df.isna().sum().sum()))
+print("Duplicate rows:", int(df.duplicated().sum()))
+print("Unique values in sex:", [int(v) for v in sorted(df["sex"].unique())])
+Code 4: Summary statistics with skewness
+desc = df.describe().T[["mean", "std", "min", "50%", "max"]]
+desc["skew"] = df.skew()
+print(desc.round(2))
+Code 5: Distribution and normality of the target
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.6))
+sns.histplot(df["progression"], kde=True, bins=25, color="#4f81bd", ax=ax[0])
+ax[0].axvline(df["progression"].mean(), color="red", ls="--", label="Mean")
+ax[0].axvline(df["progression"].median(), color="green", ls=":", label="Median")
+ax[0].set_title("Distribution of disease progression score")
+ax[0].set_xlabel("Progression (1 year after baseline)"); ax[0].legend()
+stats.probplot(df["progression"], dist="norm", plot=ax[1])
+ax[1].set_title("Q-Q plot against the normal distribution")
+plt.tight_layout(); plt.savefig(f"{FIG}/w2_target.png", dpi=150)
+print("Mean   :", round(df['progression'].mean(), 1))
+print("Median :", df['progression'].median())
+print("Skew   :", round(df['progression'].skew(), 3))
+print("Shapiro-Wilk p-value:", f"{stats.shapiro(df['progression']).pvalue:.2e}")
+Code 6: Histograms of the nine continuous predictors
+feats = ["age", "bmi", "bp", "tc", "ldl", "hdl", "tch", "ltg", "glu"]
+fig, axes = plt.subplots(3, 3, figsize=(12, 9))
+for a, c in zip(axes.ravel(), feats):
+    sns.histplot(df[c], kde=True, ax=a, color="#8064a2")
+    a.set_title(f"{c} (skew {df[c].skew():.2f})", fontsize=11)
+plt.suptitle("Distribution of the nine continuous predictors", y=1.0, fontsize=14)
+plt.tight_layout(); plt.savefig(f"{FIG}/w2_hist.png", dpi=150)
